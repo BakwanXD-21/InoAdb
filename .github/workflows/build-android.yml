@@ -13,14 +13,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { abi: arm64-v8a,   cc: aarch64-linux-android24-clang++ }
-          - { abi: armeabi-v7a, cc: armv7a-linux-androideabi24-clang++ }
-          - { abi: x86,         cc: i686-linux-android24-clang++ }
-          - { abi: x86_64,      cc: x86_64-linux-android24-clang++ }
+          - { abi: arm64-v8a }
+          - { abi: armeabi-v7a }
+          - { abi: x86_64 }
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup Android NDK r27
         uses: nttld/setup-ndk@v1
@@ -29,27 +30,29 @@ jobs:
           ndk-version: r27
           add-to-path: true
 
-      - name: Verify NDK
+      # Download BoringSSL Prebuilt / Source jika belum ada di repo
+      - name: Fetch BoringSSL & Dependencies
         run: |
-          echo "NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}"
-          echo "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          git clone --depth=1 https://boringssl.googlesource.com/boringssl external/boringssl
 
-      - name: Verify compiler
-        run: ${{ matrix.cc }} --version
+      - name: Build with CMake
+        run: |
+          mkdir -p build_${{ matrix.abi }}
+          cd build_${{ matrix.abi }}
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_NATIVE_API_LEVEL=24 \
+            -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
 
-      - name: Compile libinoadb.so
+      - name: Organize Output
         run: |
           mkdir -p jniLibs/${{ matrix.abi }}
-          ${{ matrix.cc }} -shared -fPIC -O2 \
-            -o jniLibs/${{ matrix.abi }}/libinoadb.so \
-            main.cpp -llog
+          cp build_${{ matrix.abi }}/libinoadb.so jniLibs/${{ matrix.abi }}/
 
-      - name: Verify output
-        run: file jniLibs/${{ matrix.abi }}/libinoadb.so
-
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: libinoadb-${{ matrix.abi }}
           path: jniLibs/${{ matrix.abi }}/
-          if-no-files-found: error
