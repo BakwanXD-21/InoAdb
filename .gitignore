@@ -1,0 +1,17 @@
+# Build output
+vendor/
+build/
+jniLibs/
+*.so
+*.o
+*.a
+
+# Gradle / IDE
+.gradle/
+.idea/
+*.iml
+.DS_Store
+
+# NDK
+android-ndk-*/
+Android/

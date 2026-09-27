@@ -1,0 +1,52 @@
+name: Build Android JNI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            cc:  aarch64-linux-android24-clang++
+          - abi: armeabi-v7a
+            cc:  armv7a-linux-androideabi24-clang++
+          - abi: x86
+            cc:  i686-linux-android24-clang++
+          - abi: x86_64
+            cc:  x86_64-linux-android24-clang++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK r27
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: '27.0.12077973'
+
+      - name: Verify compiler
+        run: ${{ matrix.cc }} --version
+
+      - name: Compile libinoadb.so
+        run: |
+          mkdir -p jniLibs/${{ matrix.abi }}
+          ${{ matrix.cc }} -shared -fPIC -O2 \
+            -o jniLibs/${{ matrix.abi }}/libinoadb.so \
+            main.cpp -llog
+
+      - name: Verify output
+        run: file jniLibs/${{ matrix.abi }}/libinoadb.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libinoadb-${{ matrix.abi }}
+          path: jniLibs/${{ matrix.abi }}/
+          if-no-files-found: error
