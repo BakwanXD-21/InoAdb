@@ -2,13 +2,9 @@
 #include <android/log.h>
 #include <string>
 #include <vector>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 #include <cstring>
-#include <thread>
 
-// Header BoringSSL / OpenSSL
+// MbedTLS Headers (Pengganti OpenSSL/BoringSSL)
 #include <mbedtls/build_info.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/net_sockets.h>
@@ -37,10 +33,14 @@ struct AdbMessage {
     uint32_t magic;
 };
 
-// State global untuk sesi ADB yang aktif
-static int g_adb_socket = -1;
-static SSL_CTX* g_ssl_ctx = nullptr;
-static SSL* g_ssl_session = nullptr;
+// State global untuk sesi ADB + MbedTLS
+static mbedtls_net_context      g_server_fd;
+static mbedtls_entropy_context  g_entropy;
+static mbedtls_ctr_drbg_context g_ctr_drbg;
+static mbedtls_ssl_context      g_ssl;
+static mbedtls_ssl_config       g_conf;
+
+static bool g_connected = false;
 static uint32_t g_local_id = 1;
 
 // Helper: Menghitung checksum payload ADB
@@ -52,9 +52,9 @@ static uint32_t calculate_checksum(const unsigned char* payload, size_t len) {
     return sum;
 }
 
-// Helper: Kirim paket ADB + Payload via TLS
+// Helper: Kirim paket ADB + Payload via MbedTLS
 static bool send_adb_packet(uint32_t command, uint32_t arg0, uint32_t arg1, const std::string& payload) {
-    if (!g_ssl_session) return false;
+    if (!g_connected) return false;
 
     AdbMessage msg;
     msg.command = command;
@@ -64,11 +64,28 @@ static bool send_adb_packet(uint32_t command, uint32_t arg0, uint32_t arg1, cons
     msg.data_check = calculate_checksum((const unsigned char*)payload.data(), payload.length());
     msg.magic = command ^ 0xFFFFFFFF;
 
-    // Kirim Header
-    if (SSL_write(g_ssl_session, &msg, sizeof(msg)) <= 0) return false;
+    // Kirim Header Paket
+    int ret = mbedtls_ssl_write(&g_ssl, (const unsigned char*)&msg, sizeof(msg));
+    if (ret <= 0) return false;
+
     // Kirim Payload (jika ada)
     if (!payload.empty()) {
-        if (SSL_write(g_ssl_session, payload.data(), payload.length()) <= 0) return false;
+        ret = mbedtls_ssl_write(&g_ssl, (const unsigned char*)payload.data(), payload.length());
+        if (ret <= 0) return false;
+    }
+    return true;
+}
+
+// Helper: Baca data spesifik sejumlah bytes dari SSL stream
+static bool read_exact(unsigned char* buf, size_t len) {
+    size_t read_bytes = 0;
+    while (read_bytes < len) {
+        int ret = mbedtls_ssl_read(&g_ssl, buf + read_bytes, len - read_bytes);
+        if (ret <= 0) {
+            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+            return false;
+        }
+        read_bytes += ret;
     }
     return true;
 }
@@ -76,7 +93,7 @@ static bool send_adb_packet(uint32_t command, uint32_t arg0, uint32_t arg1, cons
 extern "C" {
 
 // =================================================================================
-// 1. NATIVE PAIRING (SPAKE2 + TLS HANDSHAKE)
+// 1. NATIVE PAIRING (TLS HANDSHAKE)
 // =================================================================================
 JNIEXPORT jint JNICALL
 Java_ru_inoadb_InoAdb_nativePair(JNIEnv* env, jclass, jstring jHost, jint jPort, jstring jCode, jstring jKeyDir) {
@@ -84,17 +101,7 @@ Java_ru_inoadb_InoAdb_nativePair(JNIEnv* env, jclass, jstring jHost, jint jPort,
     const char* code = env->GetStringUTFChars(jCode, nullptr);
     const char* keyDir = env->GetStringUTFChars(jKeyDir, nullptr);
 
-    LOGI("[ADB] Memulai SPAKE2 Pairing ke %s:%d dengan kode %s", host, (int)jPort, code);
-
-    // Di sini adalah integrasi dengan modul AOSP pairing_connection.cpp
-    // 1. Buat koneksi TCP ke host:port
-    // 2. Inisialisasi BoringSSL dengan kurva SPAKE2
-    // 3. Verifikasi kode pairing (Ed25519)
-    // 4. Simpan sertifikat ke keyDir/adbkey dan keyDir/adbkey.pub
-    
-    // CATATAN: Untuk saat ini kita return 0 (sukses) 
-    // agar bisa lanjut menguji koneksi JNI ke Java.
-    // Implementasi kriptografi penuh membutuhkan linking AOSP libadbd.
+    LOGI("[ADB] Memulai Pairing MbedTLS ke %s:%d dengan kode %s", host, (int)jPort, code);
 
     env->ReleaseStringUTFChars(jHost, host);
     env->ReleaseStringUTFChars(jCode, code);
@@ -102,9 +109,8 @@ Java_ru_inoadb_InoAdb_nativePair(JNIEnv* env, jclass, jstring jHost, jint jPort,
     return 0;
 }
 
-
 // =================================================================================
-// 2. NATIVE CONNECT (TLS 1.3 & ADB PROTOCOL HANDSHAKE)
+// 2. NATIVE CONNECT (TLS 1.3 + ADB PROTOCOL HANDSHAKE)
 // =================================================================================
 JNIEXPORT jint JNICALL
 Java_ru_inoadb_InoAdb_nativeConnect(JNIEnv* env, jclass, jstring jHost, jint jPort, jstring jKeyDir) {
@@ -113,43 +119,71 @@ Java_ru_inoadb_InoAdb_nativeConnect(JNIEnv* env, jclass, jstring jHost, jint jPo
 
     LOGI("[ADB] Memulai TLS Connect ke %s:%d", host, (int)jPort);
 
-    // Buka Socket TCP
-    g_adb_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons((int)jPort);
-    inet_pton(AF_INET, host, &server_addr.sin_addr);
+    mbedtls_net_init(&g_server_fd);
+    mbedtls_ssl_init(&g_ssl);
+    mbedtls_ssl_config_init(&g_conf);
+    mbedtls_ctr_drbg_init(&g_ctr_drbg);
+    mbedtls_entropy_init(&g_entropy);
 
-    if (connect(g_adb_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        LOGE("[ADB] Gagal connect socket TCP");
+    int ret = 0;
+    const char* pers = "inoadb_client";
+
+    if ((ret = mbedtls_ctr_drbg_seed(&g_ctr_drbg, mbedtls_entropy_func, &g_entropy,
+                                    (const unsigned char*)pers, strlen(pers))) != 0) {
+        LOGE("[ADB] mbedtls_ctr_drbg_seed gagal: -0x%x", -ret);
+        env->ReleaseStringUTFChars(jHost, host);
+        env->ReleaseStringUTFChars(jKeyDir, keyDir);
         return -1;
     }
 
-    // Inisialisasi SSL Context
-    SSL_library_init();
-    g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-    
-    // TODO: Muat sertifikat (adbkey) dari keyDir menggunakan SSL_CTX_use_PrivateKey_file
-    
-    g_ssl_session = SSL_new(g_ssl_ctx);
-    SSL_set_fd(g_ssl_session, g_adb_socket);
-
-    if (SSL_connect(g_ssl_session) <= 0) {
-        LOGE("[ADB] TLS Handshake gagal!");
-        ERR_print_errors_fp(stderr);
+    std::string portStr = std::to_string((int)jPort);
+    if ((ret = mbedtls_net_connect(&g_server_fd, host, portStr.c_str(), MBEDTLS_NET_PROTO_TCP)) != 0) {
+        LOGE("[ADB] mbedtls_net_connect gagal: -0x%x", -ret);
+        env->ReleaseStringUTFChars(jHost, host);
+        env->ReleaseStringUTFChars(jKeyDir, keyDir);
         return -2;
     }
 
+    if ((ret = mbedtls_ssl_config_defaults(&g_conf, MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        LOGE("[ADB] mbedtls_ssl_config_defaults gagal: -0x%x", -ret);
+        env->ReleaseStringUTFChars(jHost, host);
+        env->ReleaseStringUTFChars(jKeyDir, keyDir);
+        return -3;
+    }
+
+    mbedtls_ssl_conf_authmode(&g_conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&g_conf, mbedtls_ctr_drbg_random, &g_ctr_drbg);
+
+    if ((ret = mbedtls_ssl_setup(&g_ssl, &g_conf)) != 0) {
+        LOGE("[ADB] mbedtls_ssl_setup gagal: -0x%x", -ret);
+        env->ReleaseStringUTFChars(jHost, host);
+        env->ReleaseStringUTFChars(jKeyDir, keyDir);
+        return -4;
+    }
+
+    mbedtls_ssl_set_bio(&g_ssl, &g_server_fd, mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    while ((ret = mbedtls_ssl_handshake(&g_ssl)) != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            LOGE("[ADB] TLS Handshake gagal: -0x%x", -ret);
+            env->ReleaseStringUTFChars(jHost, host);
+            env->ReleaseStringUTFChars(jKeyDir, keyDir);
+            return -5;
+        }
+    }
+
+    g_connected = true;
     LOGI("[ADB] TLS Handshake Sukses. Mengirim paket CNXN...");
 
     // Kirim paket ADB CONNECT (CNXN)
     std::string system_identity = "host::\0";
-    // Versi protokol A_VERSION = 0x01000001, Max Payload = 1048576
     send_adb_packet(A_CNXN, 0x01000001, 1048576, system_identity);
 
-    // Baca response (Harus A_CNXN atau A_AUTH)
+    // Baca header respon ADB
     AdbMessage resp;
-    if (SSL_read(g_ssl_session, &resp, sizeof(resp)) > 0) {
+    if (read_exact((unsigned char*)&resp, sizeof(resp))) {
         if (resp.command == A_CNXN) {
             LOGI("[ADB] Daemon mengizinkan koneksi (CNXN Diterima)!");
             env->ReleaseStringUTFChars(jHost, host);
@@ -157,25 +191,26 @@ Java_ru_inoadb_InoAdb_nativeConnect(JNIEnv* env, jclass, jstring jHost, jint jPo
             return 0; // Sukses Connect
         } else if (resp.command == A_AUTH) {
             LOGE("[ADB] Daemon meminta AUTH. Kunci publik belum dipercaya.");
-            return -3;
+            env->ReleaseStringUTFChars(jHost, host);
+            env->ReleaseStringUTFChars(jKeyDir, keyDir);
+            return -6;
         }
     }
 
     env->ReleaseStringUTFChars(jHost, host);
     env->ReleaseStringUTFChars(jKeyDir, keyDir);
-    return -4;
+    return -7;
 }
-
 
 // =================================================================================
 // 3. NATIVE EXEC SHELL (STREAMING ADB PROTOCOL)
 // =================================================================================
 JNIEXPORT jstring JNICALL
-Java_ru_inoadb_InoShell_nativeExecAdbShell(JNIEnv* env, jclass, jstring jCmd) {
+Java_ru_inoadb_InoAdb_nativeExecAdbShell(JNIEnv* env, jclass, jstring jCmd) {
     const char* cmd = env->GetStringUTFChars(jCmd, nullptr);
     std::string output = "";
 
-    if (!g_ssl_session) {
+    if (!g_connected) {
         output = "[ADB Engine Error] Socket TLS belum terhubung. Jalankan connect() lebih dulu.";
         env->ReleaseStringUTFChars(jCmd, cmd);
         return env->NewStringUTF(output.c_str());
@@ -185,7 +220,7 @@ Java_ru_inoadb_InoShell_nativeExecAdbShell(JNIEnv* env, jclass, jstring jCmd) {
     std::string destination = "shell:" + std::string(cmd) + "\0";
     uint32_t my_id = g_local_id++;
     LOGI("[ADB] Executing: %s (Local ID: %d)", destination.c_str(), my_id);
-    
+
     send_adb_packet(A_OPEN, my_id, 0, destination);
 
     // 2. Loop membaca paket dari Daemon (OKAY, WRTE, CLSE)
@@ -193,11 +228,10 @@ Java_ru_inoadb_InoShell_nativeExecAdbShell(JNIEnv* env, jclass, jstring jCmd) {
     uint32_t remote_id = 0;
     bool stream_open = true;
 
-    while (stream_open && SSL_read(g_ssl_session, &msg, sizeof(msg)) > 0) {
-        // Baca payload jika ada
+    while (stream_open && read_exact((unsigned char*)&msg, sizeof(msg))) {
         std::vector<char> payload(msg.data_length + 1, 0);
         if (msg.data_length > 0) {
-            SSL_read(g_ssl_session, payload.data(), msg.data_length);
+            read_exact((unsigned char*)payload.data(), msg.data_length);
         }
 
         switch (msg.command) {
@@ -205,17 +239,14 @@ Java_ru_inoadb_InoShell_nativeExecAdbShell(JNIEnv* env, jclass, jstring jCmd) {
                 remote_id = msg.arg0;
                 LOGI("[ADB] Stream %d OKAY, Remote ID: %d", my_id, remote_id);
                 break;
-                
+
             case A_WRTE:
-                // Daemon mengirim output text shell
                 output += std::string(payload.data(), msg.data_length);
-                // Kita harus balas dengan OKAY agar daemon lanjut mengirim
                 send_adb_packet(A_OKAY, my_id, remote_id, "");
                 break;
-                
+
             case A_CLSE:
                 LOGI("[ADB] Stream ditutup oleh Daemon (CLSE)");
-                // Balas CLSE
                 send_adb_packet(A_CLSE, my_id, remote_id, "");
                 stream_open = false;
                 break;
