@@ -9,8 +9,12 @@
 #include <thread>
 
 // Header BoringSSL / OpenSSL
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <mbedtls/build_info.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
 
 #define LOG_TAG "InoAdbNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
