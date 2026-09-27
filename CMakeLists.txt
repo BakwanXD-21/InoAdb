@@ -4,26 +4,12 @@ project(inoadb CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. Include BoringSSL
-add_subdirectory(external/boringssl EXCLUDE_FROM_ALL)
+# Flag super-ringan untuk memangkas ukuran .so hingga ~200KB
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Os -ffunction-sections -fdata-sections -fvisibility=hidden -fno-rtti -fno-exceptions")
+set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -Wl,--gc-sections -Wl,--strip-all -s")
 
-# 2. Include Header ADB & JNI
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/boringssl/include
-)
+add_library(inoadb SHARED main.cpp)
 
-# 3. Target Shared Library
-add_library(inoadb SHARED 
-    main.cpp
-    # Tambahkan file implementasi adb protocol internal di sini
-    # src/adb_client.cpp
-    # src/pairing_connection.cpp
-)
-
-# 4. Link BoringSSL & Android Syslibs
 target_link_libraries(inoadb
-    crypto
-    ssl
     log
 )

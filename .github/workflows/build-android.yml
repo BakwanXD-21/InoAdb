@@ -15,13 +15,12 @@ jobs:
         include:
           - { abi: arm64-v8a }
           - { abi: armeabi-v7a }
+          - { abi: x86 }
           - { abi: x86_64 }
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Android NDK r27
         uses: nttld/setup-ndk@v1
@@ -30,11 +29,6 @@ jobs:
           ndk-version: r27
           add-to-path: true
 
-      # Download BoringSSL Prebuilt / Source jika belum ada di repo
-      - name: Fetch BoringSSL & Dependencies
-        run: |
-          git clone --depth=1 https://boringssl.googlesource.com/boringssl external/boringssl
-
       - name: Build with CMake
         run: |
           mkdir -p build_${{ matrix.abi }}
@@ -42,7 +36,7 @@ jobs:
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_NATIVE_API_LEVEL=24 \
+            -DANDROID_NATIVE_API_LEVEL=21 \
             -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
